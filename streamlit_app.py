@@ -1,0 +1,59 @@
+import streamlit as st
+import requests
+
+API_URL = "http://127.0.0.1:8000"
+
+st.set_page_config(page_title="RAG Chat App", layout="wide")
+
+st.title("🤖 RAG Chat Assistant")
+
+# Session state for chat
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+# ---------------- Upload ---------------- #
+with st.sidebar:
+    st.header("📄 Upload Document")
+    uploaded_file = st.file_uploader("Upload PDF", type=["pdf"])
+
+    if uploaded_file and st.button("Upload"):
+        with st.spinner("Uploading..."):
+            files = {"file": (uploaded_file.name, uploaded_file, "application/pdf")}
+            res = requests.post(f"{API_URL}/upload_document", files=files)
+
+            if res.status_code == 200:
+                st.success("Uploaded successfully")
+            else:
+                st.error("Upload failed")
+
+    if st.button("🧹 Reset"):
+        requests.post(f"{API_URL}/reset_all_data")
+        st.warning("Data cleared")
+
+# ---------------- Chat ---------------- #
+st.subheader("💬 Chat")
+
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        st.write(msg["content"])
+
+query = st.chat_input("Ask something...")
+
+if query:
+    st.session_state.messages.append({"role": "user", "content": query})
+
+    with st.chat_message("user"):
+        st.write(query)
+
+    with st.chat_message("assistant"):
+        with st.spinner("Thinking..."):
+            res = requests.post(f"{API_URL}/query_document", data={"query": query})
+
+            if res.status_code == 200:
+                answer = res.json()["answer"]
+            else:
+                answer = "Error getting response"
+
+            st.write(answer)
+
+    st.session_state.messages.append({"role": "assistant", "content": answer})
