@@ -1,195 +1,121 @@
-import os
-import io
-import asyncio
-from concurrent.futures import ThreadPoolExecutor
-
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import JSONResponse
-
+from fastapi import FastAPI, UploadFile, File, Form
 from pypdf import PdfReader
-
-from langchain.text_splitter import CharacterTextSplitter
-from langchain_community.embeddings import OllamaEmbeddings
-from langchain.vectorstores import FAISS
-from langchain.memory import ConversationBufferMemory
-from langchain.chains import ConversationalRetrievalChain
-from langchain_community.llms import Ollama
-
-
-# ---------------- CONFIG ---------------- #
-DATA_DIR = os.environ.get("RAG_DATA_DIR", "rag_data")
-FAISS_PATH = os.path.join(DATA_DIR, "faiss_index")
-
-os.makedirs(DATA_DIR, exist_ok=True)
+import requests
+import faiss
+import numpy as np
+import uuid
 
 app = FastAPI()
 
-executor = ThreadPoolExecutor(max_workers=4)
+# ---------------- FAISS Setup ---------------- #
+dimension = 768  # embedding size (nomic model)
+index = faiss.IndexFlatL2(dimension)
 
-app.state.vectorstore = None
-app.state.conversation = None
-
-
-# ---------------- PDF TO TEXT ---------------- #
-def pdf_to_text(pdf_bytes: bytes) -> str:
-    text = ""
-    reader = PdfReader(io.BytesIO(pdf_bytes))
-
-    for page in reader.pages:
-        page_text = page.extract_text() or ""
-        text += page_text + "\n"
-
-    return text
+documents = []  # store text chunks
+doc_ids = []    # store ids
 
 
-# ---------------- TEXT SPLIT ---------------- #
-def split_text(text: str):
-    splitter = CharacterTextSplitter(
-        separator="\n",
-        chunk_size=1000,
-        chunk_overlap=100,
-        length_function=len,
+# ---------------- Embedding ---------------- #
+def get_embedding(text):
+    res = requests.post(
+        "http://localhost:11434/api/embeddings",
+        json={
+            "model": "nomic-embed-text",
+            "prompt": text
+        }
     )
+    return res.json()["embedding"]
 
-    return splitter.split_text(text)
 
-
-# ---------------- BUILD VECTORSTORE ---------------- #
-def build_vectorstore(chunks):
-    embeddings = OllamaEmbeddings(
-        model="nomic-embed-text:latest",
-        base_url="http://localhost:11434",  # change if needed
+# ---------------- LLM ---------------- #
+def generate(prompt):
+    res = requests.post(
+        "http://localhost:11434/api/generate",
+        json={
+            "model": "qwen2.5:1.5b",
+            "prompt": prompt,
+            "stream": False
+        }
     )
-
-    vectorstore = FAISS.from_texts(chunks, embedding=embeddings)
-
-    serialized = FAISS.serialize_to_bytes(vectorstore)
-
-    return vectorstore, serialized
+    return res.json()["response"]
 
 
-# ---------------- LOAD VECTORSTORE ---------------- #
-async def load_vectorstore():
-    if not os.path.exists(FAISS_PATH):
-        return None
-
-    embeddings = OllamaEmbeddings(
-        model="nomic-embed-text:latest",
-        base_url="http://localhost:11434",
-    )
-
-    with open(FAISS_PATH, "rb") as f:
-        serialized = f.read()
-
-    vectorstore = FAISS.deserialize_from_bytes(
-        serialized,
-        embeddings=embeddings,
-        allow_dangerous_deserialization=True,
-    )
-
-    return vectorstore
-
-
-# ---------------- CREATE CONVERSATION CHAIN ---------------- #
-async def create_conversation_chain(vstore):
-    llm = Ollama(
-        model="gemma:4b",
-        base_url="http://localhost:11434",
-    )
-
-    memory = ConversationBufferMemory(
-        memory_key="chat_history",
-        return_messages=True,
-    )
-
-    return ConversationalRetrievalChain.from_llm(
-        llm=llm,
-        retriever=vstore.as_retriever(),
-        memory=memory,
-    )
-
-
-# ---------------- UPLOAD DOCUMENT ---------------- #
+# ---------------- Upload PDF ---------------- #
 @app.post("/upload_document")
 async def upload_document(file: UploadFile = File(...)):
-    data = await file.read()
+    global documents, doc_ids
 
-    text = await asyncio.get_event_loop().run_in_executor(
-        executor, pdf_to_text, data
-    )
+    reader = PdfReader(file.file)
 
-    chunks = await asyncio.get_event_loop().run_in_executor(
-        executor, split_text, text
-    )
+    text = ""
+    for page in reader.pages:
+        text += page.extract_text() or ""
 
-    vectorstore, serialized = await asyncio.get_event_loop().run_in_executor(
-        executor, build_vectorstore, chunks
-    )
+    # Split into chunks
+    chunks = [text[i:i+500] for i in range(0, len(text), 500)]
 
-    with open(FAISS_PATH, "wb") as f:
-        f.write(serialized)
+    vectors = []
 
-    app.state.vectorstore = vectorstore
-    app.state.conversation = await create_conversation_chain(vectorstore)
+    for chunk in chunks:
+        emb = get_embedding(chunk)
+        vectors.append(emb)
+        documents.append(chunk)
+        doc_ids.append(str(uuid.uuid4()))
 
-    return {"message": "Document uploaded and indexed successfully"}
+    if vectors:
+        vectors_np = np.array(vectors).astype("float32")
+        index.add(vectors_np)
+
+    return {"message": "Stored in FAISS", "chunks": len(chunks)}
 
 
-# ---------------- QUERY DOCUMENT ---------------- #
+# ---------------- Query ---------------- #
 @app.post("/query_document")
-async def query_document(query: str = Form(...)):
-    q = query.lower().strip()
+def query_document(query: str = Form(...)):
 
-    greeting_patterns = [
-        "hi",
-        "hello",
-        "hey",
-        "hey!",
-        "hi!",
-        "good morning",
-        "good evening",
-        "good afternoon",
-    ]
+    if len(documents) == 0:
+        return {"answer": "No documents uploaded"}
 
-    for pat in greeting_patterns:
-        if pat in q:
-            return {"answer": "Hi!! How can I assist you today?"}
+    # 1. Embed query
+    query_embedding = np.array([get_embedding(query)]).astype("float32")
 
-    if app.state.vectorstore is None:
-        vstore = await load_vectorstore()
+    # 2. Search FAISS
+    k = 3
+    distances, indices = index.search(query_embedding, k)
 
-        if vstore is None:
-            raise HTTPException(
-                status_code=404,
-                detail="No document indexed. Upload a document first.",
-            )
+    retrieved_docs = []
+    for idx in indices[0]:
+        if idx < len(documents):
+            retrieved_docs.append(documents[idx])
 
-        app.state.vectorstore = vstore
-        app.state.conversation = await create_conversation_chain(vstore)
+    if not retrieved_docs:
+        return {"answer": "No relevant info found"}
 
-    loop = asyncio.get_event_loop()
+    # 3. Build context
+    context = "\n".join(retrieved_docs)
 
-    response = await loop.run_in_executor(
-        executor,
-        lambda: app.state.conversation({"question": query}),
-    )
+    # 4. Prompt
+    prompt = f"""
+You are a helpful assistant. Answer ONLY from the context below.
 
-    answer = response["answer"]
+Context:
+{context}
+
+Question:
+{query}
+"""
+
+    # 5. Generate answer
+    answer = generate(prompt)
 
     return {"answer": answer}
 
 
-# ---------------- RESET ---------------- #
+# ---------------- Reset ---------------- #
 @app.post("/reset_all_data")
-async def reset_all_data():
-    import shutil
-
-    app.state.vectorstore = None
-    app.state.conversation = None
-
-    if os.path.exists(DATA_DIR):
-        shutil.rmtree(DATA_DIR)
-
-    os.makedirs(DATA_DIR, exist_ok=True)
-
-    return {"message": "All FAISS data cleaned"}
+def reset():
+    global index, documents, doc_ids
+    index = faiss.IndexFlatL2(dimension)
+    documents = []
+    doc_ids = []
+    return {"message": "Reset successful"}
